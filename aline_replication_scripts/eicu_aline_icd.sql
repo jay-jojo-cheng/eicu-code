@@ -1,3 +1,6 @@
+DROP MATERIALIZED VIEW IF EXISTS ALINE_ICD9 CASCADE;
+CREATE MATERIALIZED VIEW ALINE_ICD9 as
+
 select pat.patientunitstayid
 
 -- endocarditis

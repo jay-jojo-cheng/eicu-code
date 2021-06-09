@@ -40,7 +40,7 @@ select
           then cast(nursingchartvalue as numeric)
       else null end)
     as gcseyes
-  from `physionet-data.eicu_crd.nursecharting`
+  from nursecharting
   -- speed up by only looking at a subset of charted data
   where nursingchartcelltypecat in
   (

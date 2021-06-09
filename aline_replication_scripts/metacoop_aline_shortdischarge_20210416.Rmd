@@ -1,0 +1,1096 @@
+---
+title: "aline-propensity-score"
+author: "J. Jojo Cheng"
+date: "April 1, 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r helper functions}
+# propensity crossfitting function adapted from personalized package
+# this version uses LOOCV and creates balanced folds in terms of 
+# treatment and control
+kfold_crossfit_propensity_glmnet_loocv <- function(x, trt,
+                                                   use.crossfitting = TRUE,
+                                                   K = 5,
+                                                   trtcoding = "minusplus")
+{
+  if (trtcoding == "minusplus"){
+    trt[trt == -1] = 0
+  }
+  
+  n_1 = NROW(trt[trt == 1])
+  n_0 = NROW(trt[trt == 0])
+  
+  rowswith1 = which(trt == 1)
+  rowswith0 = which(trt == 0)
+  
+  total_n <- NROW(x)
+  
+  tm <- "deviance"
+  
+  reorderedrowswith1 = sample(rowswith1)
+  reorderedrowswith0 = sample(rowswith0)
+  
+  foldid = rep(NA, total_n)
+  foldid[reorderedrowswith1] = sample(rep(seq(K), length = n_1))
+  foldid[reorderedrowswith0] = sample(rep(seq(K), length = n_0))
+  
+  propensvec <- numeric(total_n)
+  
+  for (i in seq(K))
+  {
+    ithfold <- foldid == i
+    
+    glmnetfolds = sum(!ithfold)
+    
+    cv.glmnet.args <- list(type.measure = tm, nfolds = glmnetfolds, grouped = FALSE)
+    
+    glmfit_propens <- do.call(cv.glmnet, c(list(y = trt[!ithfold], x = x[!ithfold,,drop=FALSE],
+                                                family = "binomial"), cv.glmnet.args))
+    
+    ## get propensity scores for the held out fold
+    propensvec[ithfold] <- unname(drop(predict(glmfit_propens, newx = x[ithfold,,drop=FALSE],
+                                             s = "lambda.1se", type = "response")))
+  }
+  
+  ## propensity scores will never be outside of 0 or 1 and
+  ## shouldn't have missing values, but this code is a safety
+  ## check just in case
+  propensvec[is.na(propensvec)] <- mean(propensvec[!is.na(propensvec)])
+  propensvec[propensvec <= 0] <- 1e-5
+  propensvec[propensvec >= 1] <- 1 - 1e-5
+  
+  propensvec
+}
+
+library(randomForestSRC)
+# new rewritten augmentation crossfitting function by JC 2021 April
+crossfit_augmentation_rf <- function(x, y, trt, prop_score_x,
+                                     use.crossfitting = TRUE, K=5,
+                                     interactions = TRUE,
+                                     trtcoding = "minusplus"){
+  
+  if (trtcoding == "minusplus"){
+    trt[trt == -1] = 0
+  }
+  
+  dat_all = data.frame(outcome = y,trt = trt,x)
+  dat_1 = data.frame(trt = 1,x)
+  dat_0 = data.frame(trt = 0,x)
+
+
+  n <- NROW(dat_all)
+  # check that all rows are either 0 or 1
+  # trt_is_one = (trt == 1)
+  # trt_is_zero = (trt == 0)
+  # print(n == sum(trt_is_one) + sum(trt_is_zero))
+  
+  predvec <- numeric(n)
+  
+  if (use.crossfitting)
+  {
+    foldid = sample(rep(seq(K), length = n))
+    
+    for (i in seq(K))
+    {
+      ithfold <- foldid == i
+      
+      v.grow <- rfsrc(outcome ~ . , data = dat_all[-ithfold, ])
+      
+      
+      if (interactions)
+      {
+        ## get predictions for trt = 1 and then trt = 0
+        v.pred1 = predict(v.grow, newdata = dat_1[ithfold,])
+        v.pred0 = predict(v.grow, newdata = dat_0[ithfold,])
+        
+        predvec[ithfold] <- (1-prop_score_x[ithfold]) * (v.pred1$predicted) + (prop_score_x[ithfold]) * (v.pred0$predicted)
+      } else
+      {
+        # get predictions for all in ith fold
+        v.pred = predict(v.grow, newdata = dat[ithfold,])
+        
+        predvec[ithfold] <- v.pred$predicted
+      }
+      
+    }
+  } else
+  {
+    
+  }
+  
+  predvec
+}
+
+concordance_calc_ties <- function(itr, y, mu_hat_x, propens, trt,
+                                  double.robust=FALSE,
+                                  trt_coding = "minusplus") {
+  # Original function by Guanhua Chen
+  # Functionality for accommodating ties in 'itr' by J. Jojo Cheng
+  
+  # Fix treatment notation
+  if(trt_coding == "minusplus"){
+    # it takes -1,1 treatment coding and changes it to 0,1 for this func.
+    trt = (trt+1)/2
+  }
+  else if(trt_coding == "zeroone"){
+    # we already have 0,1 trt coding - do nothing
+  }
+  
+  n       <- length(y)
+  y.resid <- y - mu_hat_x
+  scaled.propens.resid <- (trt - propens) / (propens * (1 - propens))
+  values <- y.resid * scaled.propens.resid
+  
+  # we sort by ITR small to big
+  order_idx = order(itr)
+  itr_ordered = itr[order_idx]
+  values_ordered <- values[order_idx]
+  
+  # each value is larger than minrank - 1 values (pos contribution)
+  # and smaller than n - maxrank values (neg contribution)
+  # note that rank returns 1 for the smallest value, etc.
+  max_itr_rank = rank(itr_ordered, ties.method = "max")
+  min_itr_rank = rank(itr_ordered, ties.method = "min")
+  
+  if(double.robust == FALSE) {
+    # we add the number of pos terms and subtract the number of neg terms
+    numberofterms = (min_itr_rank - 1) - (n - max_itr_rank)
+    conc.contribution = numberofterms * values_ordered
+  }
+  else if(double.robust == TRUE) {
+    dr.term              <- trt / propens
+    dr.term_ordered <- dr.term[order_idx] 
+    
+    # the ith element is the sum of i smallest dr values
+    cumsum.dr.term = cumsum(dr.term_ordered)
+    # the jth element is the sum of j largest dr values
+    rev_cumsum.dr.term = cumsum(rev(dr.term_ordered))
+    
+              concordance_per_lambda_study ,
+    # we explicitly create an element for zero contribution
+    # so vec[0] gives 0 and vec[i+1] gives the sum of i smallest (or largest)
+    cumsum.dr.term_zeroidx = c(0, cumsum.dr.term)
+    rev_cumsum.dr.term_zeroidx = c(0, rev_cumsum.dr.term)
+    
+    # pos contribution is sum of dr terms from smaller itrs,
+    # which is cumsum.dr.term_zeroidx[(n - max_itr_rank + 1)]
+    # neg contribution is sum of dr terms from larger itrs,
+    # which is rev_cumsum.dr.term_zeroidx[(min_itr_rank - 1 + 1)]
+    dr_scaling = cumsum.dr.term_zeroidx[(n - max_itr_rank + 1)] -
+      rev_cumsum.dr.term_zeroidx[(min_itr_rank - 1 + 1)]
+    conc.contribution = dr_scaling * values_ordered
+  }
+  
+  concordance <- (1/(n * (n-1))) * sum(conc.contribution)
+  return(concordance)
+}
+
+all_CICs_pick_lambda_beta <- function(metacoop_fit, data_list, numobsperstudy,
+                                      numstudies, outcome_list,
+                                      list_of_crossfit_augmentations,
+                                      list_of_crossfit_propensities,
+                                      treatment_list){
+  # trying to plot all the CICs vs lambda and CIC_kendall vs lambda
+
+metacoop_fit = weighted_fit_glmnet
+
+lambda_length = dim(metacoop_fit[[1]])[2]
+
+concordance_per_lambda_study = matrix(data=NA,nrow=lambda_length,ncol=numstudies)
+sign_concordance_per_lambda_study = matrix(data=NA,nrow=lambda_length,ncol=numstudies)
+concordance_kendall_tau = matrix(data=NA,nrow=lambda_length,ncol=numstudies)
+betasize_per_lambda_study = matrix(data=NA,nrow=lambda_length,ncol=numstudies)
+
+# outer ell loop for lambda
+for (ell in 1:lambda_length){
+  for (k in 1:numstudies){
+    startidx = ((k-1)*(numcovariates+1)+1)
+    endidx = startidx + numcovariates
+    
+    score_func = data_list[[k]] %*% metacoop_fit$return_beta[startidx:endidx,ell]
+    
+    # for CIC 1-4
+    concordance_per_lambda_study[ell,k] = concordance_calc_ties(score_func,
+                                                                outcome_list[[k]],
+                                                                list_of_crossfit_augmentations[[k]],
+                                                                list_of_crossfit_propensities[[k]],
+                                                                treatment_list[[k]],
+                                                                double.robust=FALSE,
+                                                                trt_coding = "minusplus")
+    # for CIC 5-6
+    sign_concordance_per_lambda_study[ell,k] = concordance_calc_ties(sign(score_func),
+                                                                     outcome_list[[k]],
+                                                                     list_of_crossfit_augmentations[[k]],
+                                                                     list_of_crossfit_propensities[[k]],
+                                                                     treatment_list[[k]],
+                                                                     double.robust=FALSE,
+                                                                     trt_coding = "minusplus")
+    
+    betasize_per_lambda_study[ell,k] = sum(metacoop_fit$return_beta[startidx:endidx,ell] != 0)
+    
+    # for CIC_kendall
+    concordance_kendall_tau[ell,k] = cor(x=score_func,
+        y= (outcome_list[[k]] - list_of_crossfit_augmentations[[k]]) * ((treatment_list[[k]]+1/2)-list_of_crossfit_propensities[[k]]) / (list_of_crossfit_propensities[[k]] * (1 - list_of_crossfit_propensities[[k]])),
+        method = "kendall")
+  }
+}
+
+# Compute CIC1
+# First version of CIC: sum_{k=1}^{K}.......
+# set this concordances to be the average of concordances
+avgconcordance_perlambda = rowSums(concordance_per_lambda_study) / numstudies
+
+# compute 0-norm of beta
+zeronorm_beta_perlambda = colSums(metacoop_fit$return_beta != 0)
+nprime = sqrt(sum(numobsperstudy^2))
+
+CIC1 = nprime*avgconcordance_perlambda - log(nprime)*zeronorm_beta_perlambda
+CIC1_best_lambda_idx = which.max(CIC1)
+CIC1_beta = metacoop_fit$return_beta[,CIC1_best_lambda_idx]
+
+# Compute CIC2
+# Second version of CIC: sum_{k=1}^{K}[n_{k}C_{k}(\beta) - log[n_{k}]||\beta||_{0}
+# compute 0-norm of beta_ks
+CIC2 = concordance_per_lambda_study %*% as.vector(numobsperstudy) - betasize_per_lambda_study %*% as.vector(log(numobsperstudy)) 
+CIC2_best_lambda_idx = which.max(CIC2)
+CIC2_beta = metacoop_fit$return_beta[,CIC2_best_lambda_idx]
+
+# Compute CIC3
+# Third version of CIC: sum_{k=1}^{K}[C_{k}(\beta)/K - log[n_{k}]||\beta||_{0}/(Kn_{k})
+# (scaled by K)
+CIC3 = rowSums(concordance_per_lambda_study) - betasize_per_lambda_study %*% as.vector(log(numobsperstudy)/numobsperstudy)
+CIC3_best_lambda_idx = which.max(CIC3)
+CIC3_beta = metacoop_fit$return_beta[,CIC3_best_lambda_idx]
+
+# Compute CIC4
+# Fourth version of CIC: sum_{k=1}^{K}[C_{k}(\beta) - 2||\beta||_{0}/(n_{k})]
+# (fixed kappa of 2)
+CIC4 = rowSums(concordance_per_lambda_study) - betasize_per_lambda_study %*% as.vector(2/numobsperstudy)
+CIC4_best_lambda_idx = which.max(CIC4)
+CIC4_beta = metacoop_fit$return_beta[,CIC4_best_lambda_idx]
+
+# Compute CIC5
+# Fifth version of CIC: same as CIC1 but with signconcordance
+avg_signconcordance_perlambda = rowSums(sign_concordance_per_lambda_study) / numstudies
+
+# compute 0-norm of beta
+zeronorm_beta_perlambda = colSums(metacoop_fit$return_beta != 0)
+nprime = sqrt(sum(numobsperstudy^2))
+
+CIC5 = nprime*avg_signconcordance_perlambda - log(nprime)*zeronorm_beta_perlambda
+CIC5_best_lambda_idx = which.max(CIC5)
+CIC5_beta = metacoop_fit$return_beta[,CIC5_best_lambda_idx]
+
+# Compute CIC6
+# Sixth version of CIC: same as CIC4 but with signconcordance
+CIC6 = rowSums(sign_concordance_per_lambda_study) - betasize_per_lambda_study %*% as.vector(2/numobsperstudy)
+CIC6_best_lambda_idx = which.max(CIC6)
+CIC6_beta = metacoop_fit$return_beta[,CIC6_best_lambda_idx]
+
+# Compute CIC_kendall
+CIC_kendall = concordance_kendall_tau %*% as.vector(numobsperstudy) - betasize_per_lambda_study %*% as.vector(log(numobsperstudy))
+CIC_kendall_best_lambda_idx = which.max(CIC_kendall)
+CIC_kendall_beta = metacoop_fit$return_beta[,CIC_kendall_best_lambda_idx]
+
+idx_list = c(CIC1_best_lambda_idx,
+             CIC2_best_lambda_idx,
+             CIC3_best_lambda_idx,
+             CIC4_best_lambda_idx,
+             CIC5_best_lambda_idx,
+             CIC6_best_lambda_idx,
+             CIC_kendall_best_lambda_idx)
+
+parameter_matrix = rbind(CIC1_beta,CIC2_beta,CIC3_beta,CIC4_beta,CIC5_beta,CIC6_beta,CIC_kendall_beta)
+
+  
+  return(list(parameters = parameter_matrix, lambda_idx = idx_list,
+              CIC1 = CIC1,
+              CIC2 = CIC2,
+              CIC3 = CIC3,
+              CIC4 = CIC4,
+              CIC5 = CIC5,
+              CIC6 = CIC6,
+              CIC_kendall = CIC_kendall,
+              concordance_per_lambda_study = concordance_per_lambda_study,
+              concordance_kendall_tau = concordance_kendall_tau,
+              numobsperstudy = numobsperstudy,
+              betasize_per_lambda_study = betasize_per_lambda_study))
+}
+
+# augmentation crossfitting function adapted from personalized package
+glmnet_aug_kfold_crossfit <- function(x, y, trt, prop_score_x, wts = NULL,
+                                      use.crossfitting = TRUE,
+                                      K = 5,
+                                      predtype = c("link", "response"),
+                                      family = c("gaussian", "binomial", "poisson", "multinomial", "cox", "mgaussian"),
+                                      interactions = TRUE, cv.glmnet.args = NULL)
+{
+  
+  predtype <- match.arg(predtype)
+  family   <- match.arg(family)
+  
+  
+  if (family == "binomial")
+  {
+    tm <- "auc"
+  } else
+  {
+    tm <- "mse"
+  }
+  
+  if (is.null(cv.glmnet.args))
+  {
+    
+    cv.glmnet.args <- list(type.measure = tm, nfolds = 5)
+  }
+  
+  cv.glmnet.args[c("x", "y", "family", "weights", "parallel")] <- NULL
+  cv.glmnet.args$parallel <- FALSE
+  
+  
+  if (!("type.measure" %in% names(cv.glmnet.args) ))
+  {
+    cv.glmnet.args$type.measure <- tm
+  }
+  
+  if (is.null(wts))
+  {
+    wts <- rep(1, NROW(x))
+  }
+  
+  if (interactions)
+  {
+    ## full model for nonzeroness
+    df_all <- data.frame(x, trt = trt)
+    df_1   <- data.frame(x, trt = 1)
+    df_0   <- data.frame(x, trt = -1)
+    
+    mm_all <- model.matrix(~x*trt-1, data = df_all)
+    mm_1   <- model.matrix(~x*trt-1, data = df_1)
+    mm_0   <- model.matrix(~x*trt-1, data = df_0)
+  } else
+  {
+    mm_all <- x
+  }
+  
+  n <- NROW(mm_all)
+  
+  predvec <- numeric(n)
+  
+  if (use.crossfitting)
+  {
+    foldid = sample(rep(seq(K), length = n))
+    
+    for (i in seq(K))
+    {
+      which <- foldid == i
+      
+      glmfit_zero_main <- do.call(cv.glmnet, c(list(y = y[!which], x = mm_all[!which,,drop=FALSE],
+                                                    weights = wts[!which], family = family), cv.glmnet.args))
+      
+      if (interactions)
+      {
+        ## get predictions for trt = 1 & -1
+        pred1_zerr <- unname(drop(predict(glmfit_zero_main, newx = mm_1[which,,drop=FALSE], s = "lambda.min", type = predtype)))
+        pred0_zerr <- unname(drop(predict(glmfit_zero_main, newx = mm_0[which,,drop=FALSE], s = "lambda.min", type = predtype)))
+        
+        predvec[which] <- (1-prop_score_x[which]) * (pred1_zerr) + (prop_score_x[which]) * (pred0_zerr)
+      } else
+      {
+        ## get predictions for trt = 1 & -1
+        pred_zerr <- unname(drop(predict(glmfit_zero_main, newx = mm_all[which,,drop=FALSE], s = "lambda.min", type = predtype)))
+        
+        predvec[which] <- pred_zerr
+      }
+      
+    }
+  } else
+  {
+    glmfit_zero_main <- do.call(cv.glmnet, c(list(y = y, x = mm_all,
+                                                  weights = wts, family = family), cv.glmnet.args))
+    
+    if (interactions)
+    {
+      ## get predictions for trt = 1 & -1
+      pred1_zerr <- unname(drop(predict(glmfit_zero_main, newx = mm_1, s = "lambda.min", type = predtype)))
+      pred0_zerr <- unname(drop(predict(glmfit_zero_main, newx = mm_0, s = "lambda.min", type = predtype)))
+      
+      predvec <- prop_score_x0.5 * (pred1_zerr + pred0_zerr)
+    } else
+    {
+      ## get predictions for trt = 1 & -1
+      pred_zerr <- unname(drop(predict(glmfit_zero_main, newx = mm_all, s = "lambda.min", type = predtype)))
+      
+      predvec <- pred_zerr
+    }
+  }
+  
+  predvec
+}
+```
+
+## Analysis of arterial line dataset
+
+This notebook is an eICU dataset replication of the Aline study replication on the mimic-code github.
+
+This notebook creates a propensity score using a dataset of patients with indwelling arterial catheters (IACs). The propensity score is built using physiology and administrative data to predict the need for an IAC. Patients are then matched, and we statistically compare the mortality rate in the two matched groups.
+
+## Load data
+
+First, we load the data and convert some variables into factors. Note this code assumes that you have the csv file available in "~/eicu-code/aline_replication_scripts/".
+
+```{r load}
+wdpath = paste(path.expand("~"),'/eicu-code/aline_replication_scripts/',sep='/')
+setwd(wdpath)
+dataset = read.csv(file="aline_dataset.csv",head=TRUE,sep=",")
+```
+
+```{r factorize, echo = FALSE}
+dataset$aline_flag = factor(dataset$aline_flag)      # treatment A
+dataset$unitdischargestatus = factor(dataset$unitdischargestatus)  # outcome status part of Y
+
+any(is.na(dataset$unitdischargeoffset))
+# FALSE, no missing discharge times
+
+dataset$unitdischargeoffset = log(as.numeric(dataset$unitdischargeoffset)) # outcome value part of Y
+
+dataset$hospitalid = factor(dataset$hospitalid)                    # hospital/study k, here K=140
+
+```
+
+
+```{r factorize, echo = FALSE}
+dataset$gender = factor(dataset$gender, levels = c("Male", "Female"))
+
+dataset$hour_icu_intime = factor(substr(dataset$unitadmittime24,start=1,stop=2))
+dataset$chf = factor(dataset$chf, levels=c(0,1))
+dataset$afib = factor(dataset$afib, levels=c(0,1))
+dataset$renal = factor(dataset$renal, levels=c(0,1))
+dataset$liver = factor(dataset$liver, levels=c(0,1))
+dataset$copd = factor(dataset$copd, levels=c(0,1))
+dataset$cad = factor(dataset$cad, levels=c(0,1))
+dataset$stroke = factor(dataset$stroke, levels=c(0,1))
+dataset$malignancy = factor(dataset$malignancy, levels=c(0,1))
+dataset$respfail = factor(dataset$respfail, levels=c(0,1))
+
+dataset$unittype = factor(dataset$unittype)
+
+dataset$map_first = as.numeric(dataset$map_first)
+dataset$aline_map_first = as.numeric(dataset$aline_map_first)
+dataset$calculated_map_first = as.numeric(dataset$calculated_map_first)
+
+dataset$map = rowMeans(data.frame(dataset$map_first, dataset$aline_map_first, dataset$calculated_map_first), na.rm = TRUE, dims = 1)
+dataset$hr_first = as.numeric(dataset$hr_first)
+dataset$temp_first = as.numeric(dataset$temp_first)
+dataset$spo2_first = as.numeric(dataset$spo2_first)
+
+dataset$admissionweight[dataset$admissionweight == "NULL"] <- NA
+for (col in c("admissionweight","temp_first","spo2_first",
+              "bun_first","creatinine_first", "chloride_first", "hgb_first",
+              "platelet_first", "potassium_first", "sodium_first", "pao2_first",
+              "paco2_first", "bicarbonate_first", "wbc_first"))
+{
+  print(col)
+  dataset[,col] = as.numeric(dataset[,col])
+}
+
+
+#? dataset$icu_hour_flag = factor(dataset$icu_hour_flag, levels=c(0,1))
+#dataset$sepsis_flag = factor(dataset$sepsis_flag, levels=c(0,1))
+#? dataset$sedative_flag = factor(dataset$sedative_flag, levels=c(0,1))
+#? dataset$fentanyl_flag = factor(dataset$fentanyl_flag, levels=c(0,1))
+#? dataset$midazolam_flag = factor(dataset$midazolam_flag, levels=c(0,1))
+#? dataset$propofol_flag = factor(dataset$propofol_flag, levels=c(0,1))
+#dataset$dilaudid_flag = factor(dataset$dilaudid_flag, levels=c(0,1))
+
+#? dataset$ards_flag = factor(dataset$ards_flag, levels=c(0,1))
+#? dataset$pneumonia_flag = factor(dataset$pneumonia_flag, levels=c(0,1))
+```
+
+```{r subselect, echo = FALSE}
+# subselect the variables that will be used
+dat = dataset[,c("aline_flag",
+                  "age_censored_89","gender","admissionweight","sofa_first","unittype",
+                  "hour_icu_intime",
+                  "chf","afib","renal",
+                  "liver","copd","cad","stroke",
+                  "malignancy","respfail",
+                  "map","hr_first","temp_first","spo2_first",
+                  "bun_first","chloride_first","creatinine_first",
+                  "hgb_first","platelet_first",
+                  "potassium_first","sodium_first",
+                "paco2_first","bicarbonate_first","pao2_first","wbc_first")]
+```
+
+```{r impute, echo = FALSE}
+# NEW IMPUTATION
+library(missForest)
+dat.imp <- missForest(dat)
+
+# SINCE THIS TAKES SOME TIME TO RUN, I SAVED IT IN 
+# load("~/metacoop/.log/missForest_impute/imputed_eicu_aline_dataset.RData")
+
+```
+
+<!-- If we did not remove any missing data above, we need to subselect complete cases for analysis. -->
+<!-- ```{r completecases, echo = FALSE} -->
+<!-- idxKeep = complete.cases(dat) -->
+<!-- dat = dat[idxKeep,] -->
+<!-- y <- dataset[idxKeep,"unitdischargeoffset"] -->
+<!-- print(paste('Removed', sum(!idxKeep),'rows with missing data.')) -->
+<!-- ``` -->
+
+```{r }
+# this code chunk runs the discharge time analysis
+discharge_data = data.frame(dataset$unitdischargeoffset, dataset$unitdischargestatus, dataset$hospitalid, dat.imp$ximp)
+names(discharge_data)[1] <- "time"
+names(discharge_data)[2] <- "status"
+names(discharge_data)[3] <- "hospitalid"
+
+
+
+# the first version we try is subsetting patients who remained alive. We will try a fancier analysis later.
+discharge_data = subset(discharge_data, status == "Alive", select = -status)
+
+# hospitals that have both treatment and control represented
+library(dplyr)
+# hospitals that have at least 5*3=15 observations for both treatment and control
+# this means under 5-fold crossfitting, during loocv glmnet, there will be
+# at least 11 observations of both treatment and control for training.
+# if we used 5*2=10, we would sometimes drop down to 7 observations which throws
+# glmnet errors
+which_hos_have_both_trt_geq_n <- discharge_data %>% 
+  group_by(hospitalid, aline_flag) %>%
+  summarise(num_rows = length(hospitalid)) %>%
+  filter(num_rows >= 15) %>%
+  group_by(hospitalid) %>%
+  summarise(num_rows = length(hospitalid)) %>%
+  filter(num_rows == 2) %>%
+  select(hospitalid)
+
+# getting hospital patient counts
+hos_pt_counts = discharge_data %>%
+  group_by(hospitalid) %>%
+  summarise(num_rows = length(hospitalid)) %>%
+  arrange(desc(num_rows)) %>%
+  filter(hospitalid %in% which_hos_have_both_trt_geq_n$hospitalid)
+
+# turning this off on 4/20 to test if putting more hospitals work
+# top N hospitals by # of patients works
+# see what we can expand it to
+top_N_hos = levels(droplevels(hos_pt_counts$hospitalid[1:50]))
+
+# overlap = discharge_data %>% 
+#   group_by(hospitalid, aline_flag) %>%
+#   summarise(num_rows = length(hospitalid)) %>%
+#   group_by(hospitalid) %>%
+#   mutate(percent = num_rows/sum(num_rows)) %>%
+#   select(hospitalid, percent) %>%
+#   filter(hospitalid %in% top_N_hos)
+# View(overlap)
+# this shows that overlap is actually OK
+
+discharge_data$hospitalid = as.character(discharge_data$hospitalid)
+discharge_data$hospitalid[!(discharge_data$hospitalid %in% top_N_hos)] <- "other"
+# discharge_data = subset(discharge_data, discharge_data$hospitalid %in% which_hos_have_both_trt_geq_10$hospitalid)
+
+
+```
+
+# ```{r exploratory data analysis}
+# library(purrr)
+# library(tidyr)
+# library(ggplot2)
+# discharge_data %>%
+#   keep(is.numeric) %>%                     # Keep only numeric columns
+#   gather() %>%                             # Convert to key-value pairs
+#   ggplot(aes(value)) +                     # Plot the values
+#     facet_wrap(~ key, scales = "free") +   # In separate panels
+#     geom_density()       
+# 
+# discharge_data %>%
+#   keep(is.numeric) %>%                     # Keep only numeric columns
+#   gather() %>%
+#   ggplot(aes(x=key, y=value)) +
+#   facet_wrap(~ key, scales = "free") +
+#   geom_violin() +
+#   geom_jitter(width=0.5, alpha=0.1)
+# 
+# 
+# library(glmnet)
+# # delete these from final version.. for debugging...
+# test = cv.glmnet(x=makeX(discharge_data[,2:33]), y=(discharge_data$time))
+# library(plotmo)
+# plotres(test)
+# coef(test, s="lambda.1se")
+# 
+# library(glmnet)
+# # delete these from final version.. for debugging...
+# test = cv.glmnet(x=makeX(discharge_data[,2:33]), y=log(discharge_data$time))
+# library(plotmo)
+# plotres(test)
+# coef(test, s="lambda.1se")
+# ```
+
+
+```{r Data prep}
+library(glmnet)
+# Data preparation
+metacoop_dat_X = discharge_data[, c("age_censored_89", "gender", "admissionweight", "sofa_first", "unittype",
+  "hour_icu_intime", "chf", "afib", "renal", "liver", "copd", "cad", "stroke",
+  "malignancy", "respfail",  "map", "hr_first", "temp_first", "spo2_first",
+  "bun_first", "chloride_first", "creatinine_first", "hgb_first",
+  "platelet_first", "potassium_first", "sodium_first", "paco2_first",
+  "bicarbonate_first", "pao2_first", "wbc_first")]
+
+metacoop_dat_X = model.matrix(~., metacoop_dat_X)
+
+
+metacoop_dat_T = discharge_data[, "aline_flag"]
+# change treatment coding to -1, 1
+levels(metacoop_dat_T) <- c("-1", "1")
+metacoop_dat_T = as.matrix(as.numeric(as.character(metacoop_dat_T)))
+
+metacoop_dat_k = as.factor(discharge_data$hospitalid)
+# LOG TRANSFORM THE OUTCOME
+metacoop_dat_Y = log(as.matrix(discharge_data[, "time"]))
+
+numstudies = length(unique(metacoop_dat_k))
+data_list <- vector(mode="list", length=numstudies)
+trt_list <- vector(mode="list", length=numstudies)
+outcome_list <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  data_list[[k]] = metacoop_dat_X[metacoop_dat_k == levels(metacoop_dat_k)[k],]
+  trt_list[[k]] = metacoop_dat_T[metacoop_dat_k == levels(metacoop_dat_k)[k]]
+  outcome_list[[k]] = metacoop_dat_Y[metacoop_dat_k == levels(metacoop_dat_k)[k]]
+}
+
+# crossfit the propensities first, because they will be needed for the scaling
+list_of_crossfit_propensities <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  print(k)
+  list_of_crossfit_propensities[[k]] = kfold_crossfit_propensity_glmnet_loocv(x = data_list[[k]],
+                                                                        trt = trt_list[[k]],
+                                                                        K = 5,
+                                                                       trtcoding = "minusplus")
+  }
+
+# normalized so the weights sum to n
+weight_list <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  weight_list[[k]] =  1/(trt_list[[k]]*list_of_crossfit_propensities[[k]] + (1-trt_list[[k]])/2)
+  weight_list[[k]] = length(weight_list[[k]])*weight_list[[k]]/sum(weight_list[[k]])
+}
+
+
+# dividing numeric variables by 2sd. sd is calculated once for weighted learning
+# and once for A learning, since the weights will change the sd
+wts = unlist(weight_list)
+ys <- unlist(outcome_list)
+ym_weighted <- weighted.mean(ys, wts)
+sy_weighted <- sqrt(sum(wts * (ys - ym_weighted)^2)/(sum(wts)-1))
+sy_nonweighted <- sd(ys)
+
+wscaled_outcome_list = outcome_list
+scaled_outcome_list = outcome_list
+for (k in 1:numstudies){
+    wscaled_outcome_list[[k]] = wscaled_outcome_list[[k]] / (2*sy_weighted)
+    scaled_outcome_list[[k]] = scaled_outcome_list[[k]] / (2*sy_nonweighted)
+}
+
+Xs = do.call(rbind,data_list)
+
+sx_weighted <- vector(mode="list", length=18)
+sx_nonweighted <- vector(mode="list", length=18)
+names(sx_weighted) <- c("age_censored_89", "admissionweight", "sofa_first", "map",
+              "hr_first", "temp_first", "spo2_first", "bun_first",
+              "chloride_first", "creatinine_first", "hgb_first",
+              "platelet_first", "potassium_first", "sodium_first",
+              "paco2_first", "bicarbonate_first", "pao2_first", "wbc_first")
+names(sx_nonweighted) <- c("age_censored_89", "admissionweight", "sofa_first", "map",
+              "hr_first", "temp_first", "spo2_first", "bun_first",
+              "chloride_first", "creatinine_first", "hgb_first",
+              "platelet_first", "potassium_first", "sodium_first",
+              "paco2_first", "bicarbonate_first", "pao2_first", "wbc_first")
+
+wscaled_data_list = data_list
+scaled_data_list = data_list
+for (col in c("age_censored_89", "admissionweight", "sofa_first", "map",
+              "hr_first", "temp_first", "spo2_first", "bun_first",
+              "chloride_first", "creatinine_first", "hgb_first",
+              "platelet_first", "potassium_first", "sodium_first",
+              "paco2_first", "bicarbonate_first", "pao2_first", "wbc_first")){
+  xm_weighted = weighted.mean(Xs[,col],wts)
+  sx_weighted[[col]] = sqrt(sum(wts * (Xs[,col] - xm_weighted)^2)/(sum(wts)-1))
+  sx_nonweighted[[col]] <- sd(Xs[,col])
+  for (k in 1:numstudies){
+    wscaled_data_list[[k]][,col] = wscaled_data_list[[k]][,col] / (2*sx_weighted[[col]])
+    scaled_data_list[[k]][,col] = scaled_data_list[[k]][,col] / (2*sx_nonweighted[[col]])
+  }
+}
+
+
+# Save rescaled data
+# load("~/metacoop/.log/rescaleddata.RData")
+```
+
+# ```{r}
+# # propensity crossfitting function adapted from personalized package
+# glmnet_propensity_kfold_crossfit <- function(x, trt, use.crossfitting = TRUE, K = 5, cv.glmnet.args = NULL)
+# {
+#   n <- NROW(x)
+#   tm <- "auc"
+#   
+#   if (is.null(cv.glmnet.args))
+#   {
+#     cv.glmnet.args <- list(type.measure = tm, nfolds = 5)
+#   }
+#   
+#   cv.glmnet.args[c("x", "y", "family", "parallel")] <- NULL
+#   cv.glmnet.args$parallel <- FALSE
+#   
+#   if (!("type.measure" %in% names(cv.glmnet.args) ))
+#   {
+#     cv.glmnet.args$type.measure <- tm
+#   }
+#   
+#   propensvec <- numeric(n)
+#   
+#   foldid = sample(rep(seq(K), length = n))
+#   
+#   for (i in seq(K))
+#   {
+#     which <- foldid == i
+#     
+#     glmfit_propens <- do.call(cv.glmnet, c(list(y = trt[!which], x = x[!which,,drop=FALSE],
+#                                                 family = "binomial"), cv.glmnet.args))
+#     
+#     ## get propensity scores for the held out fold
+#     propensvec[which] <- unname(drop(predict(glmfit_propens, newx = x[which,,drop=FALSE],
+#                                              s = "lambda.1se", type = "response")))
+#   }
+#   
+#   ## propensity scores will never be outside of 0 or 1 and
+#   ## shouldn't have missing values, but this code is a safety
+#   ## check just in case
+#   propensvec[is.na(propensvec)] <- mean(propensvec[!is.na(propensvec)])
+#   propensvec[propensvec <= 0] <- 1e-5
+#   propensvec[propensvec >= 1] <- 1 - 1e-5
+#   
+#   propensvec
+# }
+# 
+# # testing how linear augmentation looks visually
+# prop_score_x = glmnet_propensity_kfold_crossfit(x = metacoop_dat_X, trt = metacoop_dat_T,
+#                                                 K = 5, cv.glmnet.args = NULL)
+# testglmnet_X = data.frame(metacoop_dat_X, trt=metacoop_dat_T)
+# test = cv.glmnet(x = makeX(testglmnet_X), y = metacoop_dat_Y)
+# library(plotmo)
+# plotres(test)
+# coef(test, s="lambda.1se")
+# 
+# # conclusion is that using a linear model for augmentation works OK
+# ```
+
+
+```{r}
+# crossfit the augmentations (main effects)
+# this is using random forests
+list_of_crossfit_augmentations_rf_wscaled <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  print(k)
+  list_of_crossfit_augmentations_rf_wscaled[[k]] = crossfit_augmentation_rf(x = wscaled_data_list[[k]],
+                                                                 y = wscaled_outcome_list[[k]],
+                                                                 trt = trt_list[[k]],
+                                                                 prop_score_x = list_of_crossfit_propensities[[k]],
+                                                                 use.crossfitting = TRUE,
+                                                                 K=5, interactions = TRUE,
+                                                                 trtcoding = "minusplus") 
+  }
+
+list_of_crossfit_augmentations_rf_scaled <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  print(k)
+  list_of_crossfit_augmentations_rf_scaled[[k]] = crossfit_augmentation_rf(x = scaled_data_list[[k]],
+                                                                 y = scaled_outcome_list[[k]],
+                                                                 trt = trt_list[[k]],
+                                                                 prop_score_x = list_of_crossfit_propensities[[k]],data_list
+                                                                 use.crossfitting = TRUE,
+                                                                 K=5, interactions = TRUE,
+                                                                 trtcoding = "minusplus") 
+  }
+
+
+# crossfit augmentations using glmnet
+list_of_crossfit_augmentations_glmnet_wscaled <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  print(k)
+  list_of_crossfit_augmentations_glmnet_wscaled[[k]] = glmnet_aug_kfold_crossfit(x = wscaled_data_list[[k]],
+                                                                         y = wscaled_outcome_list[[k]],
+                                                                         trt = trt_list[[k]],
+                                                                         prop_score_x = list_of_crossfit_propensities[[k]],
+                                                                         wts = NULL,
+                                                                         use.crossfitting = TRUE,
+                                                                         K = 5,
+                                                                         predtype = "link",
+                                                                         family = "gaussian",
+                                                                         interactions = TRUE,
+                                                                         cv.glmnet.args = NULL)
+  }
+
+list_of_crossfit_augmentations_glmnet_scaled <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  print(k)
+  list_of_crossfit_augmentations_glmnet_scaled[[k]] = glmnet_aug_kfold_crossfit(x = scaled_data_list[[k]],
+                                                                         y = scaled_outcome_list[[k]],
+                                                                         trt = trt_list[[k]],
+                                                                         prop_score_x = list_of_crossfit_propensities[[k]],
+                                                                         wts = NULL,
+                                                                         use.crossfitting = TRUE,
+                                                                         K = 5,
+                                                                         predtype = "link",
+                                                                         family = "gaussian",
+                                                                         interactions = TRUE,
+                                                                         cv.glmnet.args = NULL)
+}
+
+# load("~/metacoop/.log/maineffectaugmentations.RData")
+```
+
+```{r}
+# we will count num obs below
+numobsperstudy = rep(NA, numstudies)
+
+Yaug_list_weighted_rf <- vector(mode="list", length=numstudies)
+Yaug_list_A_rf <- vector(mode="list", length=numstudies)
+Yaug_list_weighted_glmnet <- vector(mode="list", length=numstudies)
+Yaug_list_A_glmnet <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  numobsperstudy[k] = length(outcome_list[[k]])
+  Yaug_list_weighted_rf[[k]] =  wscaled_outcome_list[[k]] - list_of_crossfit_augmentations_rf_wscaled[[k]]
+  Yaug_list_A_rf[[k]] = scaled_outcome_list[[k]] - list_of_crossfit_augmentations_rf_scaled[[k]]
+  
+  Yaug_list_weighted_glmnet[[k]] =  wscaled_outcome_list[[k]] - list_of_crossfit_augmentations_glmnet_wscaled[[k]]
+  Yaug_list_A_glmnet[[k]] = scaled_outcome_list[[k]] - list_of_crossfit_augmentations_glmnet_scaled[[k]]
+  }
+  
+# clipped_weight_list <- vector(mode="list", length=numstudies)
+# for (k in 1:numstudies){
+#   clipped_weight_list[[k]] = pmin(10, weight_list[[k]])
+# }
+  
+# for weighted learning
+x_times_trt <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  x_times_trt[[k]] =  as.vector(trt_list[[k]]) * wscaled_data_list[[k]]
+  }
+  
+# for A-learning
+x_times_v <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  v = (trt_list[[k]] + 1)/2 - list_of_crossfit_propensities[[k]]
+  x_times_v[[k]] =  as.vector(v) * scaled_data_list[[k]]
+  }
+  
+unweighted_weights_list <- vector(mode="list", length=numstudies)
+for (k in 1:numstudies){
+  unweighted_weights_list[[k]] = rep(1,numobsperstudy[k])
+  }
+
+numcovariates = dim(data_list[[1]])[2] - 1
+
+
+```
+
+
+
+```{r}
+# Model Fitting
+
+# fit weighted learning -> regress y_aug on x_times_trt, weighted by wi
+library(metacoop)
+weighted_fit_glmnet <- fit_metacoop_cpp(x_times_trt, Yaug_list_weighted_glmnet, numcovariates + 1, 100,
+                                   numobsperstudy, weight_list, c(0,1))
+
+weighted_fit_rf <- fit_metacoop_cpp(x_times_trt, Yaug_list_weighted_rf, numcovariates + 1, 100,
+                                   numobsperstudy, weight_list, c(0,1))
+
+# fit A learning -> regress y_aug on x_times_v, weighted by 1
+# xblock, y, nobs/study, weights, lambda
+Alearning_fit_glmnet <- fit_metacoop_cpp(x_times_v, Yaug_list_A_glmnet, numcovariates + 1, 100,
+                                    numobsperstudy, unweighted_weights_list, c(0,1))
+
+Alearning_fit_rf <- fit_metacoop_cpp(x_times_v, Yaug_list_A_rf, numcovariates + 1, 100,
+                                    numobsperstudy, unweighted_weights_list, c(0,1))
+
+# load("~/metacoop/.log/metacoopfits.RData")
+```
+
+```{r CIC for choosing lambda}
+
+################################################################################
+##
+## USE CONCORDANCE TO CHOOSE LAMBDA FOR METACOOP
+##
+################################################################################
+  
+# Use CIC to pick lambda for weighted_fit and Alearning_fit
+metacoop_w_CIC_glmnet <- all_CICs_pick_lambda_beta(weighted_fit_glmnet, wscaled_data_list, numobsperstudy,
+                                            numstudies, wscaled_outcome_list,
+                                            list_of_crossfit_augmentations_glmnet_wscaled,
+                                            list_of_crossfit_propensities,
+                                            trt_list)
+metacoop_W1_beta_glmnet <- metacoop_w_CIC_glmnet$parameters[1,]
+metacoop_W2_beta_glmnet <- metacoop_w_CIC_glmnet$parameters[2,]
+metacoop_W3_beta_glmnet <- metacoop_w_CIC_glmnet$parameters[3,]
+metacoop_W4_beta_glmnet <- metacoop_w_CIC_glmnet$parameters[4,]
+metacoop_W5_beta_glmnet <- metacoop_w_CIC_glmnet$parameters[5,]
+metacoop_W6_beta_glmnet <- metacoop_w_CIC_glmnet$parameters[6,]
+weighted_lambda_idx_glmnet = metacoop_w_CIC_glmnet$lambda_idx
+
+metacoop_w_CIC_rf <- all_CICs_pick_lambda_beta(weighted_fit_rf, wscaled_data_list, numobsperstudy,
+                                            numstudies, wscaled_outcome_list,
+                                            list_of_crossfit_augmentations_rf_wscaled,
+                                            list_of_crossfit_propensities,
+                                            trt_list)
+metacoop_W1_beta_rf <- metacoop_w_CIC_rf$parameters[1,]
+metacoop_W2_beta_rf <- metacoop_w_CIC_rf$parameters[2,]
+metacoop_W3_beta_rf <- metacoop_w_CIC_rf$parameters[3,]
+metacoop_W4_beta_rf <- metacoop_w_CIC_rf$parameters[4,]
+metacoop_W5_beta_rf <- metacoop_w_CIC_rf$parameters[5,]
+metacoop_W6_beta_rf <- metacoop_w_CIC_rf$parameters[6,]
+weighted_lambda_idx_rf = metacoop_w_CIC_rf$lambda_idx
+
+  
+metacoop_A_CIC_glmnet <- all_CICs_pick_lambda_beta(Alearning_fit_glmnet, scaled_data_list, numobsperstudy,
+                                            numstudies, scaled_outcome_list,
+                                            list_of_crossfit_augmentations_glmnet_scaled,
+                                            list_of_crossfit_propensities,
+                                            trt_list)
+metacoop_A1_beta_glmnet <- metacoop_A_CIC_glmnet$parameters[1,]
+metacoop_A2_beta_glmnet <- metacoop_A_CIC_glmnet$parameters[2,]
+metacoop_A3_beta_glmnet <- metacoop_A_CIC_glmnet$parameters[3,]
+metacoop_A4_beta_glmnet <- metacoop_A_CIC_glmnet$parameters[4,]
+metacoop_A5_beta_glmnet <- metacoop_A_CIC_glmnet$parameters[5,]
+metacoop_A6_beta_glmnet <- metacoop_A_CIC_glmnet$parameters[6,]
+Alearning_lambda_idx_glmnet = metacoop_A_CIC_glmnet$lambda_idx
+
+metacoop_A_CIC_rf <- all_CICs_pick_lambda_beta(Alearning_fit_rf, scaled_data_list, numobsperstudy,
+                                            numstudies, scaled_outcome_list,
+                                            list_of_crossfit_augmentations_rf_scaled,
+                                            list_of_crossfit_propensities,
+                                            trt_list)
+metacoop_A1_beta_rf <- metacoop_A_CIC_rf$parameters[1,]
+metacoop_A2_beta_rf <- metacoop_A_CIC_rf$parameters[2,]
+metacoop_A3_beta_rf <- metacoop_A_CIC_rf$parameters[3,]
+metacoop_A4_beta_rf <- metacoop_A_CIC_rf$parameters[4,]
+metacoop_A5_beta_rf <- metacoop_A_CIC_rf$parameters[5,]
+metacoop_A6_beta_rf <- metacoop_A_CIC_rf$parameters[6,]
+Alearning_lambda_idx_rf = metacoop_A_CIC_rf$lambda_idx
+
+
+```
+
+```{r Show Prof. Chen ongoing scaling issues}
+load("~/metacoop/.log/meeting_6_4_21.RData")
+
+# CIC curves all look like this (note all negative)
+plot(metacoop_w_CIC_glmnet$CIC1)
+plot(metacoop_w_CIC_glmnet$CIC_kendall)
+
+# look at concordances
+View(metacoop_w_CIC_glmnet$concordance_per_lambda_study)
+View(metacoop_w_CIC_glmnet$concordance_kendall_tau)
+
+# look at first term (concordance*n)
+plot(metacoop_w_CIC_glmnet$concordance_per_lambda_study %*% as.vector(metacoop_w_CIC_glmnet$numobsperstudy))
+summary(metacoop_w_CIC_glmnet$concordance_per_lambda_study %*% as.vector(metacoop_w_CIC_glmnet$numobsperstudy))
+
+# look at second term (-df*log(n))
+plot(- metacoop_w_CIC_glmnet$betasize_per_lambda_study %*% as.vector(log(metacoop_w_CIC_glmnet$numobsperstudy)))
+summary(- metacoop_w_CIC_g2lmnet$betasize_per_lambda_study %*% as.vector(log(metacoop_w_CIC_glmnet$numobsperstudy)))
+
+# look at how scaling the Y variable affects the CIC
+# e.g. try 1 through 10
+scalingfactor = 6
+plot(scalingfactor * metacoop_w_CIC_glmnet$concordance_kendall_tau %*% as.vector(metacoop_w_CIC_glmnet$numobsperstudy) - metacoop_w_CIC_glmnet$betasize_per_lambda_study %*% as.vector(log(metacoop_w_CIC_glmnet$numobsperstudy)))
+
+
+```
+
+```{r Comparison with pooled glmnet analysis}
+pooled_x_times_trt = do.call(rbind,x_times_trt)
+pooled_Yaug_list_weighted_glmnet = unlist(Yaug_list_weighted_glmnet)
+pooled_weights = unlist(weight_list)
+
+stacked_weighted_fit <- cv.glmnet(pooled_x_times_trt, pooled_Yaug_list_weighted_glmnet,
+                                    weights = pooled_weights, intercept = FALSE)
+coef(stacked_weighted_fit, s="lambda.1se")
+
+# conclusion: glmnet still finds a little bit signal
+
+# example interpretation
+averages = colMeans(abs(metacoop_dat_X))
+exp(-averages[["platelet_first"]]*0.022198704*sy_weighted/sx_weighted[["platelet_first"]])
+# 4.44% decrease in ICU stay when keeping all variables but platelet constant
+# and picking the right treatment based off of platelets
+```
+
+```{r PCA plot of treatment rule variation}
+# analysis of returned parameters
+
+weighted_parameter_data = data.frame(matrix(weighted_fit_glmnet$return_beta[,80],
+                                            nrow = numstudies,
+                                            byrow = TRUE),
+                                     row.names = levels(metacoop_dat_k))
+
+names(weighted_parameter_data) <- colnames(metacoop_dat_X)
+
+# drop columns with all zeros
+dropped_cols = weighted_parameter_data[,-(which(colSums(weighted_parameter_data) == 0))] 
+
+summary(dropped_cols)
+
+
+
+# pca_res = prcomp(dropped_cols)
+# 
+# library(ggfortify)
+# 
+# autoplot(pca_res, loadings = TRUE, label = TRUE, loadings.label = TRUE,
+#          shape = FALSE, label.size = 3)
+# 
+
+```
+
+```{r Average contribution to decision function}
+
+averages = colMeans(metacoop_dat_X)
+
+decision_contribution = data.frame(as.matrix(weighted_parameter_data) %*% diag(averages))
+
+names(decision_contribution) = names(weighted_parameter_data)
+
+# drop columns with all zeros
+decision_contribution = decision_contribution[,-(which(colSums(decision_contribution) == 0))]
+
+summary(decision_contribution)
+
+varnames = names(decision_contribution)
+library(tidyverse)
+reshaped_decision_con <- decision_contribution %>% 
+  gather(varnames) %>% 
+  slice(rep(row_number(), val)) %>% 
+  select(-val)
+
+ggplot(reshaped_decision_con, aes(names(decision_contribution))) +
+  geom_violin()
+
+
+
+```
