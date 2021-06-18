@@ -897,7 +897,7 @@ for (k in 1:numstudies){
   x_times_v[[k]] =  as.vector(v) * scaled_data_list[[k]]
   }
   
-unweighted_weights_list <- vector(mode="list", length=numstudies)
+unweighted_weights_list <- vector(mode="list", length=numstudies)wscaled
 for (k in 1:numstudies){
   unweighted_weights_list[[k]] = rep(1,numobsperstudy[k])
   }
@@ -1016,10 +1016,64 @@ plot(- metacoop_w_CIC_glmnet$betasize_per_lambda_study %*% as.vector(log(metacoo
 summary(- metacoop_w_CIC_g2lmnet$betasize_per_lambda_study %*% as.vector(log(metacoop_w_CIC_glmnet$numobsperstudy)))
 
 # look at how scaling the Y variable affects the CIC
-# e.g. try 1 through 10
-scalingfactor = 6
-plot(scalingfactor * metacoop_w_CIC_glmnet$concordance_kendall_tau %*% as.vector(metacoop_w_CIC_glmnet$numobsperstudy) - metacoop_w_CIC_glmnet$betasize_per_lambda_study %*% as.vector(log(metacoop_w_CIC_glmnet$numobsperstudy)))
+scalingfactor = 1/seq(from = 1, to = 10, length.out = 1000)
 
+recenter.rescale <- function(x){
+  r.vec = (x - mean(x)) / sd(x)
+  return(r.vec)
+}
+
+CIC_curves = matrix(data = NA, nrow = 1000, ncol = 100)
+for (i in 1:1000){
+  CIC_curves[i,] = recenter.rescale(metacoop_w_CIC_glmnet$concordance_per_lambda_study %*% as.vector(metacoop_w_CIC_glmnet$numobsperstudy) - scalingfactor[i] * metacoop_w_CIC_glmnet$betasize_per_lambda_study %*% as.vector(log(metacoop_w_CIC_glmnet$numobsperstudy)))
+}
+
+# add vertical lines when the number of coefficients jumps
+beta_count = rowSums(metacoop_w_CIC_glmnet$betasize_per_lambda_study)
+vlines = which(c(FALSE, tail(beta_count,-1) != head(beta_count,-1)))
+
+library(gplots)
+library(RColorBrewer)
+coul <- colorRampPalette(brewer.pal(8, "PiYG"))(25)
+heatmap.2(CIC_curves, Colv = FALSE, Rowv = FALSE, col = coul, xlab = "lambda index",
+        ylab = "gamma index", main = "CIC curves",
+        #heatmap.2 specific parameters
+        density.info = "none", # Remove density legend lines
+        trace = "none",
+        dendrogram = "none",
+        # add grey lines showing the jumps in parameter numbers
+        colsep = vlines, sepcolor = "gray")
+
+# per lambda
+matplot(CIC_curves, type = "l")
+# around 400 is good
+
+# per gamma
+matplot(t(CIC_curves), type = "l")
+# around 80 is good
+
+# now we show heatmaps for the finite differences in both the lambda and gamma direction
+lambda_differences = matrix(data = NA, nrow = 1000, ncol = 99)
+for (i in 1:1000){
+  lambda_differences[i,] = diff(CIC_curves[i,])
+}
+heatmap.2(lambda_differences, Colv = FALSE, Rowv = FALSE, col = coul, xlab = "lambda index",
+        ylab = "gamma index", main = "lambda differences",
+        #heatmap.2 specific parameters
+        density.info = "none", # Remove density legend lines
+        trace = "none",
+        dendrogram = "none")
+
+gamma_differences = matrix(data = NA, nrow = 999, ncol = 100)
+for (j in 1:100){
+  gamma_differences[,j] = diff(CIC_curves[,j])
+}
+heatmap.2(gamma_differences, Colv = FALSE, Rowv = FALSE, col = coul, xlab = "lambda index",
+        ylab = "gamma index", main = "gamma differences",
+        #heatmap.2 specific parameters
+        density.info = "none", # Remove density legend lines
+        trace = "none",
+        dendrogram = "none")
 
 ```
 
@@ -1056,7 +1110,10 @@ dropped_cols = weighted_parameter_data[,-(which(colSums(weighted_parameter_data)
 
 summary(dropped_cols)
 
-
+# box plot of nonzero coefficients
+library(reshape)
+meltData <- melt(dropped_cols)
+boxplot(data=meltData, value~variable,las=2)
 
 # pca_res = prcomp(dropped_cols)
 # 
