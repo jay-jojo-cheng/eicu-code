@@ -1,4 +1,13 @@
 -- exports the aline dataset to CSV
+-- this is the last script to run
+-- you should do things in this order:
+-- Run angus.sql
+-- Run eicu_aline_cohort.sql
+-- Run aline_lab.sql
+-- Run aline_gcs.sql
+-- Run aline_vital.sql
+-- Run aline_sofa.sql
+-- Run aline_dataset.sql and save result to csv
 
 select co.patientunitstayid, patienthealthsystemstayid, uniquepid, aline_flag, iac_first_meastime,
 unitdischargetime24, unitdischargeoffset, unitdischargestatus,
