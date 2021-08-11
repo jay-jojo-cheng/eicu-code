@@ -16,4 +16,4 @@ on co.patientunitstayid = sofa.patientunitstayid
 left join public.aline_vital vit
 on co.patientunitstayid = vit.patientunitstayid
 left join public.aline_lab lab
-on co.patientunitstayid = lab.patientunitstayid
+on co.patientunitstayid = lab.patientunitstayid;

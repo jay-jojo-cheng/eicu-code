@@ -73,7 +73,7 @@ AND pat.unittype LIKE ANY (array['MICU', 'SICU', 'Med-Surg ICU', 'Neuro ICU']) -
 -- Exclusion criteria
 AND pat.patientunitstayid NOT IN
 	(select distinct patientunitstayid
- 	from public.aline_angus
+ 	from public.angus
  	where angus = 1) -- angus
 AND pat.patientunitstayid NOT IN
 	(select distinct patientunitstayid

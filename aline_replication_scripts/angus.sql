@@ -1,5 +1,5 @@
-DROP MATERIALIZED VIEW IF EXISTS ALINE_ANGUS CASCADE;
-CREATE MATERIALIZED VIEW ALINE_ANGUS as
+DROP MATERIALIZED VIEW IF EXISTS ANGUS CASCADE;
+CREATE MATERIALIZED VIEW ANGUS as
 
 SELECT patientunitstayid, infection, organ_dysfunction, explicit_sepsis, mech_vent,
 CASE
@@ -31,16 +31,16 @@ FROM (SELECT patientunitstayid, MAX(infection) as infection,
 				CASE
 					-- Acute Organ Dysfunction Diagnosis Codes
 					WHEN SUBSTR(icd9code,1,3) IN ('458','293','570','584') THEN 1
-					WHEN SUBSTR(icd9code,1,4) IN ('785.5','348.3','348.1',
+					WHEN SUBSTR(icd9code,1,5) IN ('785.5','348.3','348.1',
 							'287.4','287.5','286.9','286.6','573.4')  THEN 1
 					ELSE 0 END AS organ_dysfunction,
 					-- Explicit diagnosis of severe sepsis or septic shock
 					CASE
-					WHEN SUBSTR(icd9code,1,5) IN ('995.92','785.52')  THEN 1
+					WHEN SUBSTR(icd9code,1,6) IN ('995.92','785.52')  THEN 1
 			  		WHEN apacheadmissiondx like '%Sepsis%' THEN 1
 					ELSE 0 END AS explicit_sepsis,
 				CASE
-					WHEN icd9code IN ('967.0', '967.1', '967.2') THEN 1
+					WHEN SUBSTR(icd9code,1,5) IN ('96.70', '96.71', '96.72') THEN 1
 					ELSE 0 END AS mech_vent
 			FROM eicu_crd.diagnosis diag
 			  LEFT JOIN eicu_crd.patient pat
